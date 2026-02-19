@@ -3,9 +3,7 @@ package main
 import (
 	"context"
 	"database/sql"
-	"io"
 	"log"
-	"net/http"
 	"os"
 	"time"
 
@@ -25,280 +23,225 @@ var (
 	myDB      *sql.DB
 )
 
-func env(key, fallback string) string {
-	if v := os.Getenv(key); v != "" {
-		return v
+func main() {
+	// Initialize ALL DB connections
+	initRedis()
+	initMongo()
+	initPostgres()
+	initMySQL()
+
+	r := gin.Default()
+
+	// Simplified Endpoints - Deterministic & Input-Driven
+	r.GET("/redis/:val", handleRedis)
+	r.GET("/mongo/:val", handleMongo)
+	r.GET("/postgres/:val", handlePostgres)
+	r.GET("/mysql/:val", handleMySQL)
+	r.GET("/all/:val", handleAll)
+
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = "8080"
 	}
-	return fallback
+	log.Printf("Starting simplified multi-kind app on :%s", port)
+	r.Run(":" + port)
 }
 
-func main() {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
+// --- Handlers ---
 
-	// ── Redis ──
-	rdb = redis.NewClient(&redis.Options{
-		Addr: env("REDIS_ADDR", "redis-test-svc:6379"),
-	})
-	if err := rdb.Ping(ctx).Err(); err != nil {
-		log.Printf("WARN: Redis not reachable: %v", err)
+func handleRedis(c *gin.Context) {
+	val := c.Param("val")
+	ctx := c.Request.Context()
+
+	// SET key=val, value=val
+	if err := rdb.Set(ctx, val, val, 60*time.Second).Err(); err != nil {
+		c.JSON(500, gin.H{"error": "Redis SET failed: " + err.Error()})
+		return
+	}
+
+	// GET key=val
+	res, err := rdb.Get(ctx, val).Result()
+	if err != nil {
+		c.JSON(500, gin.H{"error": "Redis GET failed: " + err.Error()})
+		return
+	}
+
+	c.JSON(200, gin.H{"source": "redis", "key": val, "value": res})
+}
+
+func handleMongo(c *gin.Context) {
+	val := c.Param("val")
+	ctx := c.Request.Context()
+
+	// Upsert document with _id=val
+	filter := bson.M{"_id": val}
+	update := bson.M{"$set": bson.M{"value": val}}
+	opts := options.Update().SetUpsert(true)
+
+	_, err := mongoColl.UpdateOne(ctx, filter, update, opts)
+	if err != nil {
+		c.JSON(500, gin.H{"error": "Mongo UpdateOne failed: " + err.Error()})
+		return
+	}
+
+	// Find document
+	var res bson.M
+	if err := mongoColl.FindOne(ctx, filter).Decode(&res); err != nil {
+		c.JSON(500, gin.H{"error": "Mongo FindOne failed: " + err.Error()})
+		return
+	}
+
+	c.JSON(200, gin.H{"source": "mongo", "doc": res})
+}
+
+func handlePostgres(c *gin.Context) {
+	val := c.Param("val")
+	// Insert (ignore error if exists for simplicity, or we can create table without unique constraint)
+	// We'll just insert.
+	_, err := pgDB.ExecContext(c.Request.Context(), "INSERT INTO items(name) VALUES($1)", val)
+	if err != nil {
+		c.JSON(500, gin.H{"error": "Postgres INSERT failed: " + err.Error()})
+		return
+	}
+
+	// Select
+	var name string
+	err = pgDB.QueryRowContext(c.Request.Context(), "SELECT name FROM items WHERE name=$1 ORDER BY id DESC LIMIT 1", val).Scan(&name)
+	if err != nil {
+		c.JSON(500, gin.H{"error": "Postgres SELECT failed: " + err.Error()})
+		return
+	}
+
+	c.JSON(200, gin.H{"source": "postgres", "value": name})
+}
+
+func handleMySQL(c *gin.Context) {
+	val := c.Param("val")
+	// Insert
+	_, err := myDB.ExecContext(c.Request.Context(), "INSERT INTO items(name) VALUES(?)", val)
+	if err != nil {
+		c.JSON(500, gin.H{"error": "MySQL INSERT failed: " + err.Error()})
+		return
+	}
+
+	// Select
+	var name string
+	err = myDB.QueryRowContext(c.Request.Context(), "SELECT name FROM items WHERE name=? ORDER BY id DESC LIMIT 1", val).Scan(&name)
+	if err != nil {
+		c.JSON(500, gin.H{"error": "MySQL SELECT failed: " + err.Error()})
+		return
+	}
+
+	c.JSON(200, gin.H{"source": "mysql", "value": name})
+}
+
+func handleAll(c *gin.Context) {
+	val := c.Param("val")
+	ctx := c.Request.Context()
+	res := gin.H{"source": "all"}
+
+	// 1. Redis
+	if err := rdb.Set(ctx, val, val, 60*time.Second).Err(); err == nil {
+		v, _ := rdb.Get(ctx, val).Result()
+		res["redis"] = v
+	} else {
+		res["redis_error"] = err.Error()
+	}
+
+	// 2. Mongo
+	filter := bson.M{"_id": val}
+	update := bson.M{"$set": bson.M{"value": val}}
+	opts := options.Update().SetUpsert(true)
+	mongoColl.UpdateOne(ctx, filter, update, opts)
+	var mDoc bson.M
+	mongoColl.FindOne(ctx, filter).Decode(&mDoc)
+	res["mongo"] = mDoc
+
+	// 3. Postgres
+	pgDB.ExecContext(ctx, "INSERT INTO items(name) VALUES($1)", val)
+	var pgName string
+	pgDB.QueryRowContext(ctx, "SELECT name FROM items WHERE name=$1 ORDER BY id DESC LIMIT 1", val).Scan(&pgName)
+	res["postgres"] = pgName
+
+	// 4. MySQL
+	myDB.ExecContext(ctx, "INSERT INTO items(name) VALUES(?)", val)
+	var myName string
+	myDB.QueryRowContext(ctx, "SELECT name FROM items WHERE name=? ORDER BY id DESC LIMIT 1", val).Scan(&myName)
+	res["mysql"] = myName
+
+	c.JSON(200, res)
+}
+
+// --- Init Functions ---
+
+func initRedis() {
+	addr := os.Getenv("REDIS_ADDR")
+	if addr == "" {
+		addr = "localhost:6379"
+	}
+	rdb = redis.NewClient(&redis.Options{Addr: addr})
+	if err := rdb.Ping(context.Background()).Err(); err != nil {
+		log.Printf("Warning: Failed to connect to Redis: %v", err)
 	} else {
 		log.Println("Redis connected")
 	}
+}
 
-	// ── MongoDB ──
-	mongoURI := env("MONGO_URI", "mongodb://mongo-test-svc:27017")
-	mc, err := mongo.Connect(ctx, options.Client().ApplyURI(mongoURI))
+func initMongo() {
+	uri := os.Getenv("MONGO_URI")
+	if uri == "" {
+		uri = "mongodb://localhost:27017"
+	}
+	clientOptions := options.Client().ApplyURI(uri)
+	client, err := mongo.Connect(context.Background(), clientOptions)
 	if err != nil {
-		log.Printf("WARN: Mongo connect error: %v", err)
+		log.Printf("Warning: Failed to connect to Mongo: %v", err)
+		return
+	}
+	// Verify connection
+	if err := client.Ping(context.Background(), nil); err != nil {
+		log.Printf("Warning: Mongo Ping failed: %v", err)
+	}
+	mongoColl = client.Database("testdb").Collection("items")
+	log.Println("Mongo connected")
+}
+
+func initPostgres() {
+	dsn := os.Getenv("PG_DSN")
+	if dsn == "" {
+		dsn = "postgres://user:pass@localhost:5432/db?sslmode=disable"
+	}
+	var err error
+	pgDB, err = sql.Open("postgres", dsn)
+	if err != nil {
+		log.Printf("Warning: Failed to open Postgres: %v", err)
+		return
+	}
+	if err := pgDB.Ping(); err != nil {
+		log.Printf("Warning: Postgres Ping failed: %v", err)
 	} else {
-		mongoColl = mc.Database("testdb").Collection("items")
-		log.Println("Mongo connected")
+		log.Println("Postgres connected")
+		// Create table
+		pgDB.Exec("CREATE TABLE IF NOT EXISTS items (id SERIAL PRIMARY KEY, name TEXT)")
 	}
+}
 
-	// ── PostgreSQL ──
-	pgDSN := env("PG_DSN", "postgres://testuser:testpass@postgres-test-svc:5432/testdb?sslmode=disable")
-	pgDB, err = sql.Open("postgres", pgDSN)
+func initMySQL() {
+	dsn := os.Getenv("MYSQL_DSN")
+	if dsn == "" {
+		dsn = "user:pass@tcp(localhost:3306)/db"
+	}
+	var err error
+	myDB, err = sql.Open("mysql", dsn)
 	if err != nil {
-		log.Printf("WARN: Postgres open error: %v", err)
+		log.Printf("Warning: Failed to open MySQL: %v", err)
+		return
+	}
+	if err := myDB.Ping(); err != nil {
+		log.Printf("Warning: MySQL Ping failed: %v", err)
 	} else {
-		pgDB.SetMaxOpenConns(5)
-		if err := pgDB.PingContext(ctx); err != nil {
-			log.Printf("WARN: Postgres ping error: %v", err)
-		} else {
-			log.Println("Postgres connected")
-			_, _ = pgDB.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS items (id SERIAL PRIMARY KEY, name TEXT, created_at TIMESTAMP DEFAULT NOW())`)
-		}
+		log.Println("MySQL connected")
+		// Create table
+		myDB.Exec("CREATE TABLE IF NOT EXISTS items (id INT AUTO_INCREMENT PRIMARY KEY, name VARCHAR(255))")
 	}
-
-	// ── MySQL ──
-	myDSN := env("MYSQL_DSN", "testuser:testpass@tcp(mysql-test-svc:3306)/testdb?parseTime=true")
-	myDB, err = sql.Open("mysql", myDSN)
-	if err != nil {
-		log.Printf("WARN: MySQL open error: %v", err)
-	} else {
-		myDB.SetMaxOpenConns(5)
-		if err := myDB.PingContext(ctx); err != nil {
-			log.Printf("WARN: MySQL ping error: %v", err)
-		} else {
-			log.Println("MySQL connected")
-			_, _ = myDB.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS items (id INT AUTO_INCREMENT PRIMARY KEY, name VARCHAR(255), created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)`)
-		}
-	}
-
-	// ── Routes ──
-	r := gin.Default()
-
-	r.GET("/healthz", func(c *gin.Context) { c.JSON(200, gin.H{"status": "ok"}) })
-
-	// Single-kind endpoints
-	r.GET("/redis-only", handleRedisOnly)
-	r.GET("/mongo-only", handleMongoOnly)
-	r.GET("/postgres-only", handlePostgresOnly)
-	r.GET("/mysql-only", handleMySQLOnly)
-	r.GET("/http-only", handleHTTPOnly)
-
-	// Multi-kind endpoints
-	r.GET("/redis-mongo", handleRedisMongo)
-	r.GET("/triple", handleTriple)
-	r.GET("/all-dbs", handleAllDBs)
-	r.GET("/kitchen-sink", handleKitchenSink)
-
-	port := env("PORT", "8080")
-	log.Printf("Starting multi-kind-app on :%s", port)
-	if err := r.Run(":" + port); err != nil {
-		log.Fatal(err)
-	}
-}
-
-// ── Single-kind handlers ──
-
-func handleRedisOnly(c *gin.Context) {
-	ctx := c.Request.Context()
-	key := "test-key-static"
-	if err := rdb.Set(ctx, key, "hello-redis", 60*time.Second).Err(); err != nil {
-		c.JSON(500, gin.H{"error": err.Error()})
-		return
-	}
-	val, err := rdb.Get(ctx, key).Result()
-	if err != nil {
-		c.JSON(500, gin.H{"error": err.Error()})
-		return
-	}
-	c.JSON(200, gin.H{"source": "redis", "key": key, "value": val})
-}
-
-func handleMongoOnly(c *gin.Context) {
-	ctx := c.Request.Context()
-	doc := bson.M{"name": "test-item", "ts": 1234567890}
-	_, err := mongoColl.InsertOne(ctx, doc)
-	if err != nil {
-		c.JSON(500, gin.H{"error": err.Error()})
-		return
-	}
-	var result bson.M
-	err = mongoColl.FindOne(ctx, bson.M{"name": "test-item"}).Decode(&result)
-	if err != nil {
-		c.JSON(500, gin.H{"error": err.Error()})
-		return
-	}
-	c.JSON(200, gin.H{"source": "mongo", "document": result})
-}
-
-func handlePostgresOnly(c *gin.Context) {
-	ctx := c.Request.Context()
-	_, err := pgDB.ExecContext(ctx, `INSERT INTO items (name) VALUES ($1)`, "pg-item")
-	if err != nil {
-		c.JSON(500, gin.H{"error": err.Error()})
-		return
-	}
-	var id int
-	var name string
-	err = pgDB.QueryRowContext(ctx, `SELECT id, name FROM items ORDER BY id DESC LIMIT 1`).Scan(&id, &name)
-	if err != nil {
-		c.JSON(500, gin.H{"error": err.Error()})
-		return
-	}
-	c.JSON(200, gin.H{"source": "postgres", "id": id, "name": name})
-}
-
-func handleMySQLOnly(c *gin.Context) {
-	ctx := c.Request.Context()
-	_, err := myDB.ExecContext(ctx, `INSERT INTO items (name) VALUES (?)`, "mysql-item")
-	if err != nil {
-		c.JSON(500, gin.H{"error": err.Error()})
-		return
-	}
-	var id int
-	var name string
-	err = myDB.QueryRowContext(ctx, `SELECT id, name FROM items ORDER BY id DESC LIMIT 1`).Scan(&id, &name)
-	if err != nil {
-		c.JSON(500, gin.H{"error": err.Error()})
-		return
-	}
-	c.JSON(200, gin.H{"source": "mysql", "id": id, "name": name})
-}
-
-func handleHTTPOnly(c *gin.Context) {
-	resp, err := http.Get("https://httpbin.org/get")
-	if err != nil {
-		c.JSON(500, gin.H{"error": err.Error()})
-		return
-	}
-	defer resp.Body.Close()
-	body, _ := io.ReadAll(resp.Body)
-	c.JSON(200, gin.H{"source": "http", "status": resp.StatusCode, "bodyLen": len(body)})
-}
-
-// ── Multi-kind handlers ──
-
-func handleRedisMongo(c *gin.Context) {
-	ctx := c.Request.Context()
-
-	// Redis
-	rdb.Set(ctx, "multi-key", "from-redis", 60*time.Second)
-	redisVal, _ := rdb.Get(ctx, "multi-key").Result()
-
-	// Mongo
-	mongoColl.InsertOne(ctx, bson.M{"name": "multi-item", "ts": 1234567890})
-	var mongoDoc bson.M
-	mongoColl.FindOne(ctx, bson.M{"name": "multi-item"}).Decode(&mongoDoc)
-
-	c.JSON(200, gin.H{
-		"redis": redisVal,
-		"mongo": mongoDoc,
-	})
-}
-
-func handleTriple(c *gin.Context) {
-	ctx := c.Request.Context()
-
-	// Redis
-	rdb.Set(ctx, "triple-key", "value", 60*time.Second)
-	redisVal, _ := rdb.Get(ctx, "triple-key").Result()
-
-	// Mongo
-	mongoColl.InsertOne(ctx, bson.M{"name": "triple-item", "ts": 1234567890})
-	var mongoDoc bson.M
-	mongoColl.FindOne(ctx, bson.M{"name": "triple-item"}).Decode(&mongoDoc)
-
-	// Postgres
-	pgDB.ExecContext(ctx, `INSERT INTO items (name) VALUES ($1)`, "triple-pg")
-	var pgName string
-	pgDB.QueryRowContext(ctx, `SELECT name FROM items ORDER BY id DESC LIMIT 1`).Scan(&pgName)
-
-	c.JSON(200, gin.H{
-		"redis":    redisVal,
-		"mongo":    mongoDoc,
-		"postgres": pgName,
-	})
-}
-
-func handleAllDBs(c *gin.Context) {
-	ctx := c.Request.Context()
-
-	// Redis
-	rdb.Set(ctx, "all-key", "value", 60*time.Second)
-	redisVal, _ := rdb.Get(ctx, "all-key").Result()
-
-	// Mongo
-	mongoColl.InsertOne(ctx, bson.M{"name": "all-item", "ts": 1234567890})
-	var mongoDoc bson.M
-	mongoColl.FindOne(ctx, bson.M{"name": "all-item"}).Decode(&mongoDoc)
-
-	// Postgres
-	pgDB.ExecContext(ctx, `INSERT INTO items (name) VALUES ($1)`, "all-pg")
-	var pgName string
-	pgDB.QueryRowContext(ctx, `SELECT name FROM items ORDER BY id DESC LIMIT 1`).Scan(&pgName)
-
-	// MySQL
-	myDB.ExecContext(ctx, `INSERT INTO items (name) VALUES (?)`, "all-mysql")
-	var myName string
-	myDB.QueryRowContext(ctx, `SELECT name FROM items ORDER BY id DESC LIMIT 1`).Scan(&myName)
-
-	c.JSON(200, gin.H{
-		"redis":    redisVal,
-		"mongo":    mongoDoc,
-		"postgres": pgName,
-		"mysql":    myName,
-	})
-}
-
-func handleKitchenSink(c *gin.Context) {
-	ctx := c.Request.Context()
-
-	// Redis
-	rdb.Set(ctx, "sink-key", "value", 60*time.Second)
-	redisVal, _ := rdb.Get(ctx, "sink-key").Result()
-
-	// Mongo
-	mongoColl.InsertOne(ctx, bson.M{"name": "sink-item", "ts": 1234567890})
-	var mongoDoc bson.M
-	mongoColl.FindOne(ctx, bson.M{"name": "sink-item"}).Decode(&mongoDoc)
-
-	// Postgres
-	pgDB.ExecContext(ctx, `INSERT INTO items (name) VALUES ($1)`, "sink-pg")
-	var pgName string
-	pgDB.QueryRowContext(ctx, `SELECT name FROM items ORDER BY id DESC LIMIT 1`).Scan(&pgName)
-
-	// MySQL
-	myDB.ExecContext(ctx, `INSERT INTO items (name) VALUES (?)`, "sink-mysql")
-	var myName string
-	myDB.QueryRowContext(ctx, `SELECT name FROM items ORDER BY id DESC LIMIT 1`).Scan(&myName)
-
-	// HTTP external call
-	resp, err := http.Get("https://httpbin.org/get")
-	httpStatus := 0
-	if err == nil {
-		httpStatus = resp.StatusCode
-		resp.Body.Close()
-	}
-
-	c.JSON(200, gin.H{
-		"redis":      redisVal,
-		"mongo":      mongoDoc,
-		"postgres":   pgName,
-		"mysql":      myName,
-		"httpStatus": httpStatus,
-	})
 }
