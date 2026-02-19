@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"database/sql"
 	"log"
 	"net/http"
 	"os"
@@ -11,8 +10,6 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
-	_ "github.com/go-sql-driver/mysql"
-	_ "github.com/lib/pq"
 	"github.com/redis/go-redis/v9"
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/mongo"
@@ -20,10 +17,8 @@ import (
 )
 
 var (
-	col  *mongo.Collection
-	rdb  *redis.Client
-	pgDB *sql.DB
-	myDB *sql.DB
+	col *mongo.Collection
+	rdb *redis.Client
 )
 
 type Item struct {
@@ -40,7 +35,8 @@ func main() {
 	if mongoURI == "" {
 		mongoURI = "mongodb://mongodb-svc:27017"
 	}
-	mClient, err := mongo.Connect(context.Background(), options.Client().ApplyURI(mongoURI))
+	mClient, err := mongo.Connect(context.Background(),
+		options.Client().ApplyURI(mongoURI))
 	if err != nil {
 		log.Fatalf("mongo connect: %v", err)
 	}
@@ -59,48 +55,16 @@ func main() {
 		log.Println("Redis connected")
 	}
 
-	// ── PostgreSQL ──
-	pgDSN := os.Getenv("PG_DSN")
-	if pgDSN == "" {
-		pgDSN = "postgres://postgres:postgres@postgres-svc:5432/testdb?sslmode=disable"
-	}
-	pgDB, err = sql.Open("postgres", pgDSN)
-	if err != nil {
-		log.Printf("postgres open warning: %v", err)
-	} else if err := pgDB.Ping(); err != nil {
-		log.Printf("postgres ping warning: %v", err)
-	} else {
-		pgDB.Exec("CREATE TABLE IF NOT EXISTS items (id SERIAL PRIMARY KEY, name TEXT)")
-		log.Println("Postgres connected")
-	}
-
-	// ── MySQL ──
-	myDSN := os.Getenv("MYSQL_DSN")
-	if myDSN == "" {
-		myDSN = "root:root@tcp(mysql-svc:3306)/testdb"
-	}
-	myDB, err = sql.Open("mysql", myDSN)
-	if err != nil {
-		log.Printf("mysql open warning: %v", err)
-	} else if err := myDB.Ping(); err != nil {
-		log.Printf("mysql ping warning: %v", err)
-	} else {
-		myDB.Exec("CREATE TABLE IF NOT EXISTS items (id INT AUTO_INCREMENT PRIMARY KEY, name VARCHAR(255))")
-		log.Println("MySQL connected")
-	}
-
 	// ── Routes ──
 	r := gin.Default()
 
-	// Single-DB routes (to test each kind individually)
-	r.GET("/redis/:val", handleRedisOnly)
-	r.GET("/mongo/:val", handleMongoOnly)
-	r.GET("/postgres/:val", handlePostgresOnly)
-	r.GET("/mysql/:val", handleMySQLOnly)
+	// Single-DB routes — test each kind individually
+	r.GET("/redis/:val", handleRedisOnly) // ONLY Redis → Kind: "Redis"
+	r.GET("/mongo/:val", handleMongoOnly) // ONLY Mongo → Kind: "Mongo"
 
-	// Multi-DB routes (to test multi-kind)
-	r.POST("/api/item", createItem)
-	r.GET("/api/item/:id", getItem)
+	// Multi-DB routes — test multi-kind
+	r.POST("/api/item", createItem) // Mongo + Redis
+	r.GET("/api/item/:id", getItem) // Mongo + Redis
 
 	port := os.Getenv("PORT")
 	if port == "" {
@@ -162,40 +126,6 @@ func handleMongoOnly(c *gin.Context) {
 		return
 	}
 	c.JSON(200, gin.H{"source": "mongo", "doc": doc})
-}
-
-// handlePostgresOnly — ONLY touches Postgres. Should produce Kind: "Postgres"
-func handlePostgresOnly(c *gin.Context) {
-	val := c.Param("val")
-	ctx := c.Request.Context()
-
-	if _, err := pgDB.ExecContext(ctx, "INSERT INTO items(name) VALUES($1)", val); err != nil {
-		c.JSON(500, gin.H{"error": "pg INSERT: " + err.Error()})
-		return
-	}
-	var name string
-	if err := pgDB.QueryRowContext(ctx, "SELECT name FROM items WHERE name=$1 LIMIT 1", val).Scan(&name); err != nil {
-		c.JSON(500, gin.H{"error": "pg SELECT: " + err.Error()})
-		return
-	}
-	c.JSON(200, gin.H{"source": "postgres", "value": name})
-}
-
-// handleMySQLOnly — ONLY touches MySQL. Should produce Kind: "MySQL"
-func handleMySQLOnly(c *gin.Context) {
-	val := c.Param("val")
-	ctx := c.Request.Context()
-
-	if _, err := myDB.ExecContext(ctx, "INSERT INTO items(name) VALUES(?)", val); err != nil {
-		c.JSON(500, gin.H{"error": "mysql INSERT: " + err.Error()})
-		return
-	}
-	var name string
-	if err := myDB.QueryRowContext(ctx, "SELECT name FROM items WHERE name=? LIMIT 1", val).Scan(&name); err != nil {
-		c.JSON(500, gin.H{"error": "mysql SELECT: " + err.Error()})
-		return
-	}
-	c.JSON(200, gin.H{"source": "mysql", "value": name})
 }
 
 // ──────────── Multi-DB Handlers ────────────
