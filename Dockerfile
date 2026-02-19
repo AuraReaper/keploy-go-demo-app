@@ -1,13 +1,27 @@
-FROM golang:1.23-alpine AS builder
+# === Build Stage === (same pattern as gin-mongo sample)
+FROM golang:1.22-bookworm AS build-stage
 
 WORKDIR /app
 COPY go.mod go.sum ./
 RUN go mod download
-COPY main.go .
-RUN CGO_ENABLED=0 go build -ldflags="-s -w" -o /bin/multi-kind-app .
 
-FROM alpine:latest
-RUN apk add --no-cache ca-certificates curl
-COPY --from=builder /bin/multi-kind-app /bin/multi-kind-app
+COPY *.go ./
+RUN CGO_ENABLED=0 go build -o /main
+
+# === Runtime Stage ===
+FROM alpine:3.19
+
+RUN addgroup -S keploy \
+ && adduser -S keploy -G keploy -h /home/keploy \
+ && mkdir -p /home/keploy/app \
+ && chown -R keploy:keploy /home/keploy/app \
+ && apk add --no-cache dumb-init \
+ && rm -rf /var/cache/apk/*
+
+WORKDIR /home/keploy/app
+COPY --from=build-stage --chown=keploy:keploy /main /home/keploy/app/main
+
+ENTRYPOINT ["dumb-init"]
+USER keploy
 EXPOSE 8080
-ENTRYPOINT ["/bin/multi-kind-app"]
+CMD ["./main"]
