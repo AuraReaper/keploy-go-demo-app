@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"database/sql"
-	"fmt"
 	"io"
 	"log"
 	"net/http"
@@ -116,7 +115,7 @@ func main() {
 
 func handleRedisOnly(c *gin.Context) {
 	ctx := c.Request.Context()
-	key := fmt.Sprintf("test-key-%d", time.Now().UnixNano())
+	key := "test-key-static"
 	if err := rdb.Set(ctx, key, "hello-redis", 60*time.Second).Err(); err != nil {
 		c.JSON(500, gin.H{"error": err.Error()})
 		return
@@ -131,7 +130,7 @@ func handleRedisOnly(c *gin.Context) {
 
 func handleMongoOnly(c *gin.Context) {
 	ctx := c.Request.Context()
-	doc := bson.M{"name": "test-item", "ts": time.Now().Unix()}
+	doc := bson.M{"name": "test-item", "ts": 1234567890}
 	_, err := mongoColl.InsertOne(ctx, doc)
 	if err != nil {
 		c.JSON(500, gin.H{"error": err.Error()})
@@ -201,7 +200,7 @@ func handleRedisMongo(c *gin.Context) {
 	redisVal, _ := rdb.Get(ctx, "multi-key").Result()
 
 	// Mongo
-	mongoColl.InsertOne(ctx, bson.M{"name": "multi-item", "ts": time.Now().Unix()})
+	mongoColl.InsertOne(ctx, bson.M{"name": "multi-item", "ts": 1234567890})
 	var mongoDoc bson.M
 	mongoColl.FindOne(ctx, bson.M{"name": "multi-item"}).Decode(&mongoDoc)
 
@@ -219,7 +218,7 @@ func handleTriple(c *gin.Context) {
 	redisVal, _ := rdb.Get(ctx, "triple-key").Result()
 
 	// Mongo
-	mongoColl.InsertOne(ctx, bson.M{"name": "triple-item", "ts": time.Now().Unix()})
+	mongoColl.InsertOne(ctx, bson.M{"name": "triple-item", "ts": 1234567890})
 	var mongoDoc bson.M
 	mongoColl.FindOne(ctx, bson.M{"name": "triple-item"}).Decode(&mongoDoc)
 
@@ -243,7 +242,7 @@ func handleAllDBs(c *gin.Context) {
 	redisVal, _ := rdb.Get(ctx, "all-key").Result()
 
 	// Mongo
-	mongoColl.InsertOne(ctx, bson.M{"name": "all-item", "ts": time.Now().Unix()})
+	mongoColl.InsertOne(ctx, bson.M{"name": "all-item", "ts": 1234567890})
 	var mongoDoc bson.M
 	mongoColl.FindOne(ctx, bson.M{"name": "all-item"}).Decode(&mongoDoc)
 
@@ -273,7 +272,7 @@ func handleKitchenSink(c *gin.Context) {
 	redisVal, _ := rdb.Get(ctx, "sink-key").Result()
 
 	// Mongo
-	mongoColl.InsertOne(ctx, bson.M{"name": "sink-item", "ts": time.Now().Unix()})
+	mongoColl.InsertOne(ctx, bson.M{"name": "sink-item", "ts": 1234567890})
 	var mongoDoc bson.M
 	mongoColl.FindOne(ctx, bson.M{"name": "sink-item"}).Decode(&mongoDoc)
 
