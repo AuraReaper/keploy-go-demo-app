@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"io"
 	"log"
 	"net/http"
 	"os"
@@ -61,6 +62,7 @@ func main() {
 	// Single-DB routes — test each kind individually
 	r.GET("/redis/:val", handleRedisOnly) // ONLY Redis → Kind: "Redis"
 	r.GET("/mongo/:val", handleMongoOnly) // ONLY Mongo → Kind: "Mongo"
+	r.GET("/http", handleHTTPOnly)        // ONLY HTTP  → Kind: "Http"
 
 	// Multi-DB routes — test multi-kind
 	r.POST("/api/item", createItem) // Mongo + Redis
@@ -126,6 +128,18 @@ func handleMongoOnly(c *gin.Context) {
 		return
 	}
 	c.JSON(200, gin.H{"source": "mongo", "doc": doc})
+}
+
+// handleHTTPOnly — makes an external HTTP call. Should produce Kind: "Http"
+func handleHTTPOnly(c *gin.Context) {
+	resp, err := http.Get("https://jsonplaceholder.typicode.com/todos/1")
+	if err != nil {
+		c.JSON(500, gin.H{"error": "http GET: " + err.Error()})
+		return
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	c.Data(200, "application/json", body)
 }
 
 // ──────────── Multi-DB Handlers ────────────
